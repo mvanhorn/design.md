@@ -14,7 +14,7 @@
 
 import { defineCommand } from 'citty';
 import { colorBlindContrastRule, DEFAULT_RULE_DESCRIPTORS, lint } from '../linter/index.js';
-import { readInput, formatOutput } from '../utils.js';
+import { readInput, formatOutput, FileReadError } from '../utils.js';
 
 export default defineCommand({
   meta: {
@@ -39,7 +39,17 @@ export default defineCommand({
     },
   },
   async run({ args }) {
-    const content = await readInput(args.file);
+    let content: string;
+    try {
+      content = await readInput(args.file);
+    } catch (error) {
+      if (error instanceof FileReadError) {
+        process.stderr.write(`Error: ${error.friendlyMessage}\n`);
+        process.exitCode = 2;
+        return;
+      }
+      throw error;
+    }
     const report = args.cvd
       ? lint(content, { rules: [...DEFAULT_RULE_DESCRIPTORS, colorBlindContrastRule] })
       : lint(content);
