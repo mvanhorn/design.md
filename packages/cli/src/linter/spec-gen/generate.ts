@@ -42,6 +42,7 @@ async function main() {
     ...cfg,
     // Renderer functions — pre-bound to config so MDX calls are clean
     frontmatterExample: () => renderers.frontmatterExample(cfg),
+    interleavedExample: () => renderers.interleavedExample(cfg),
     colorsExample: () => renderers.colorsExample(cfg),
     typographyExample: () => renderers.typographyExample(cfg),
     componentsExample: () => renderers.componentsExample(cfg),
@@ -49,6 +50,7 @@ async function main() {
     sectionOrderList: () => renderers.sectionOrderList(cfg),
     componentSubTokenList: () => renderers.componentSubTokenList(cfg),
     recommendedTokens: () => renderers.recommendedTokens(cfg),
+    typeDefinitions: (typeName?: string) => renderers.typeDefinitions(cfg, typeName),
   };
 
   const generated = await compileMdx(source, scope);

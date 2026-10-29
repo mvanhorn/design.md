@@ -32,6 +32,7 @@ import {
   isParseableDimension,
   isTokenReference,
   parseDimensionParts,
+  VALID_TYPOGRAPHY_PROPS,
   resetTailwindV4ModeRegistry,
   registerTailwindV4ModeRegistry,
 } from './spec.js';
@@ -43,6 +44,7 @@ import {
 } from '../spec-config.js';
 
 const SCHEMA_KEY_SET: ReadonlySet<string> = new Set(SCHEMA_KEYS);
+const TYPOGRAPHY_PROP_SET: ReadonlySet<string> = new Set(VALID_TYPOGRAPHY_PROPS);
 
 type PrimitiveCategory = 'colors' | 'rounded' | 'spacing';
 
@@ -84,7 +86,10 @@ export class ModelHandler implements ModelSpec {
       // ── Phase 1: Resolve primitive tokens ──────────────────────────
       // Colors
       if (input.colors) {
+        const isCollision = buildCollisionGuard('colors', findings);
         forEachTokenValue(input.colors, themes, (name, raw) => {
+          if (isCollision(name)) return;
+
           if (isModeValueObject(raw, themes)) {
             processColorModeValue(name, raw, themes, defaultTheme, colors, symbolTable, modeRaw, modeTokenNames, findings);
           } else {
@@ -105,7 +110,10 @@ export class ModelHandler implements ModelSpec {
 
       // Rounded
       if (input.rounded) {
+        const isCollision = buildCollisionGuard('rounded', findings);
         forEachTokenValue(input.rounded, themes, (name, raw) => {
+          if (isCollision(name)) return;
+
           if (isModeValueObject(raw, themes)) {
             processDimensionModeValue('rounded', name, raw, themes, defaultTheme, rounded, symbolTable, modeRaw, modeTokenNames, findings);
           } else {
@@ -117,7 +125,10 @@ export class ModelHandler implements ModelSpec {
 
       // Spacing
       if (input.spacing) {
+        const isCollision = buildCollisionGuard('spacing', findings);
         forEachTokenValue(input.spacing, themes, (name, raw) => {
+          if (isCollision(name)) return;
+
           if (isModeValueObject(raw, themes)) {
             processDimensionModeValue('spacing', name, raw, themes, defaultTheme, spacing, symbolTable, modeRaw, modeTokenNames, findings);
           } else {
@@ -127,57 +138,27 @@ export class ModelHandler implements ModelSpec {
         }, '', 0, findings, 'spacing');
       }
 
-      // ── Phase 2: Resolve chained color references ──────────────────
-      // Iterate color entries that are still raw references and resolve them
-      if (input.colors) {
-        forEachTokenValue(input.colors, themes, (name, raw) => {
-          const reference = getDefaultReference(raw, themes, defaultTheme);
-          if (reference) {
-            const resolved = resolveReference(symbolTable, reference.slice(1, -1), new Set());
-            if (resolved !== null && typeof resolved === 'object' && 'type' in resolved && resolved.type === 'color') {
-              colors.set(name, resolved as ResolvedColor);
-              symbolTable.set(`colors.${name}`, resolved);
-            }
-          }
-        });
-      }
+      // ── Phase 2: Resolve chained token references ──────────────────
+      // Iterate the symbol table directly (not re-walking raw input) so that
+      // Phase 1 collision decisions are never overwritten.
+      for (const [key, value] of symbolTable) {
+        if (typeof value !== 'string' || !isTokenReference(value)) continue;
+        const resolved = resolveReference(symbolTable, value.slice(1, -1), new Set());
+        if (resolved === null || typeof resolved !== 'object' || !('type' in resolved)) continue;
 
-      // Resolve chained rounded references
-      if (input.rounded) {
-        forEachTokenValue(input.rounded, themes, (name, raw) => {
-          const reference = getDefaultReference(raw, themes, defaultTheme);
-          if (reference) {
-            const resolved = resolveReference(symbolTable, reference.slice(1, -1), new Set());
-            if (
-              resolved !== null &&
-              typeof resolved === 'object' &&
-              'type' in resolved &&
-              resolved.type === 'dimension'
-            ) {
-              rounded.set(name, resolved as ResolvedDimension);
-              symbolTable.set(`rounded.${name}`, resolved);
-            }
-          }
-        });
-      }
-
-      // Resolve chained spacing references
-      if (input.spacing) {
-        forEachTokenValue(input.spacing, themes, (name, raw) => {
-          const reference = getDefaultReference(raw, themes, defaultTheme);
-          if (reference) {
-            const resolved = resolveReference(symbolTable, reference.slice(1, -1), new Set());
-            if (
-              resolved !== null &&
-              typeof resolved === 'object' &&
-              'type' in resolved &&
-              resolved.type === 'dimension'
-            ) {
-              spacing.set(name, resolved as ResolvedDimension);
-              symbolTable.set(`spacing.${name}`, resolved);
-            }
-          }
-        });
+        if (key.startsWith('colors.') && resolved.type === 'color') {
+          const name = key.slice('colors.'.length);
+          colors.set(name, resolved as ResolvedColor);
+          symbolTable.set(key, resolved);
+        } else if (key.startsWith('rounded.') && resolved.type === 'dimension') {
+          const name = key.slice('rounded.'.length);
+          rounded.set(name, resolved as ResolvedDimension);
+          symbolTable.set(key, resolved);
+        } else if (key.startsWith('spacing.') && resolved.type === 'dimension') {
+          const name = key.slice('spacing.'.length);
+          spacing.set(name, resolved as ResolvedDimension);
+          symbolTable.set(key, resolved);
+        }
       }
 
       const modes = resolveModeStates(themes, modeRaw, findings);
@@ -239,6 +220,7 @@ export class ModelHandler implements ModelSpec {
           description: input.description,
           themes: themes.length > 0 ? themes : undefined,
           defaultTheme,
+          omitted: input.omitted,
           colors,
           typography,
           rounded,
@@ -540,13 +522,6 @@ function recordModeObjectValues(
   }
 }
 
-function getDefaultReference(raw: unknown, themes: string[], defaultTheme: string | undefined): string | undefined {
-  if (typeof raw === 'string' && isTokenReference(raw)) return raw;
-  if (!isModeValueObject(raw, themes) || !defaultTheme) return undefined;
-  const value = raw[defaultTheme];
-  return typeof value === 'string' && isTokenReference(value) ? value : undefined;
-}
-
 function resolveModeStates(
   themes: string[],
   modeRaw: Map<string, RawModeBucket>,
@@ -682,6 +657,45 @@ function isModeValueObject(value: unknown, themes: string[]): value is Record<st
 }
 
 /**
+ * Returns a predicate that detects token name collisions within a single
+ * token category (colors, rounded, spacing). Call once per category; the
+ * returned function tracks state via closure.
+ *
+ * Returns true (and pushes a finding) when the candidate name collides with
+ * an already-registered key, so callers can skip it with a simple `if
+ * (isCollision(name)) return;`.
+ */
+function buildCollisionGuard(
+  category: string,
+  findings: Finding[],
+): (name: string) => boolean {
+  const seenKeys = new Set<string>();
+  const seenNormalized = new Map<string, string>();
+  return (name: string): boolean => {
+    const normalized = name.replace(/\./g, '-');
+    if (seenKeys.has(name)) {
+      findings.push({
+        severity: 'error',
+        path: `${category}.${name}`,
+        message: `Duplicate token path '${category}.${name}' detected.`,
+      });
+      return true;
+    }
+    if (seenNormalized.has(normalized)) {
+      findings.push({
+        severity: 'error',
+        path: `${category}.${name}`,
+        message: `Grouped ${category} token flattens to '${normalized}', which is already defined.`,
+      });
+      return true;
+    }
+    seenKeys.add(name);
+    seenNormalized.set(normalized, name);
+    return false;
+  };
+}
+
+/**
  * Parse a CSS color string into a ResolvedColor with RGB + WCAG luminance.
  */
 export function parseColor(raw: string): ResolvedColor {
@@ -698,8 +712,22 @@ export function parseColor(raw: string): ResolvedColor {
 /**
  * Parse a dimension string like "42px" or "1.5rem".
  */
-function parseDimension(raw: string): ResolvedDimension {
-  const parts = parseDimensionParts(raw);
+function parseDimension(raw: any): ResolvedDimension {
+  // Defensive type guard – prevents "raw.match is not a function" crash
+  // and provides a clear error message for unexpected input types.
+  if (typeof raw !== 'string') {
+    throw new Error(
+      `parseDimension expected a string, got ${typeof raw}. ` +
+      `This usually indicates a malformed token in your design file.`,
+    );
+  }
+  const value = raw.trim();
+  if (value === '') {
+    throw new Error(
+      'parseDimension received an empty string. Please provide a valid dimension (e.g., "16px", "1.5rem").',
+    );
+  }
+  const parts = parseDimensionParts(value);
   if (!parts) {
     throw new Error(`Invalid dimension: ${raw}`);
   }
@@ -780,6 +808,19 @@ function parseTypography(props: Record<string, string | number>, path: string, f
           message: `'${raw}' is not a valid dimension.`,
         });
       }
+    }
+  }
+
+  // Surface typography sub-properties that aren't part of the schema: they are
+  // silently dropped (never resolved or emitted), so warn rather than ignore —
+  // mirroring how unknown component sub-tokens are reported.
+  for (const key of Object.keys(props)) {
+    if (!TYPOGRAPHY_PROP_SET.has(key)) {
+      findings.push({
+        severity: 'warning',
+        path: `${path}.${key}`,
+        message: `'${key}' is not a recognized typography property. Valid properties: ${VALID_TYPOGRAPHY_PROPS.join(', ')}.`,
+      });
     }
   }
 
